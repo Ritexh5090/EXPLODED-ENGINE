@@ -1,0 +1,888 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>EXPLODED ENGINE</title>
+<style>
+  :root { --cyan:#7df9ff; --gold:#ffd166; }
+  html, body { margin:0; height:100%; background:#02050a; overflow:hidden;
+               font-family:"Courier New", monospace; color:var(--cyan); }
+  /* Layer order (bottom -> top): webcam, 3D particles, HUD drawing, UI */
+  #cam { position:fixed; inset:0; width:100%; height:100%; object-fit:cover;
+         transform:scaleX(-1);               /* mirror like a real mirror */
+         filter:brightness(.55) saturate(.7) contrast(1.05); }
+  #three, #hud { position:fixed; inset:0; width:100%; height:100%; pointer-events:none; }
+  #title { position:fixed; top:18px; left:22px; font-size:22px; letter-spacing:6px;
+           text-shadow:0 0 14px var(--cyan), 0 0 3px #000; }
+  #title small { display:block; font-size:11px; letter-spacing:2px; opacity:.8; margin-top:4px; }
+  #help { position:fixed; top:18px; right:22px; font-size:12px; line-height:1.7;
+          background:rgba(5,15,25,.72); border:1px solid rgba(125,249,255,.3);
+          border-radius:10px; padding:10px 14px; max-width:330px; }
+  #help b { color:var(--gold); }
+  #credit { position:fixed; left:22px; bottom:22px; font-size:12px; line-height:1.6;
+            letter-spacing:1px; text-shadow:0 0 4px #000; pointer-events:none; }
+  #credit b { color:var(--gold); font-weight:normal; letter-spacing:2px; }
+  #credit span { opacity:.85; }
+  #status { position:fixed; left:50%; bottom:86px; transform:translateX(-50%);
+            font-size:12px; opacity:.95; white-space:nowrap; text-shadow:0 0 4px #000; }
+  #tabs { position:fixed; left:50%; bottom:22px; transform:translateX(-50%);
+          display:flex; gap:8px; padding:8px; background:rgba(5,15,25,.75);
+          border:1px solid rgba(125,249,255,.35); border-radius:12px;
+          backdrop-filter:blur(6px); }
+  #tabs button { font:inherit; font-size:13px; color:var(--cyan); background:transparent;
+                 border:1px solid transparent; padding:8px 14px; border-radius:8px; cursor:pointer; }
+  #tabs button.on { border-color:var(--gold); color:var(--gold); background:rgba(255,209,102,.1); }
+</style>
+</head>
+<body>
+<video id="cam" playsinline muted></video>
+<canvas id="three"></canvas>
+<canvas id="hud"></canvas>
+
+<div id="title">EXPLODED ENGINE<small>pull machines apart with your hands</small></div>
+<div id="help">
+  <b>GESTURES</b><br>
+  🤏 pinch <b>on a part</b> + move → <b>pull it out</b><br>
+  &nbsp;&nbsp;&nbsp;release far = stays removed · release near = snaps back<br>
+  🤏 pinch <b>on empty space</b> + move → <b>rotate</b><br>
+  🙌 two open hands apart → <b>exploded view</b><br>
+  🤏🤏 two pinched hands apart → <b>zoom</b><br>
+  👆 point at a tab 1 sec → <b>switch machine</b><br>
+  <b>KEYS</b> 1-3 switch · E explode · R reinstall all<br>
+  <b>MOUSE</b> drag a part to pull it · drag space to rotate · scroll zoom
+</div>
+<div id="credit"><b>Design &amp; developed by Ritesh Jagtap</b><br><span>Insta - ritexh404.exe</span></div>
+<div id="status"></div>
+<div id="tabs"></div>
+
+<script type="importmap">
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
+</script>
+
+<script type="module">
+import * as THREE from "three";
+
+// =====================================================================
+// 0. SMALL HELPERS
+// =====================================================================
+const $ = (id) => document.getElementById(id);
+const TAU = Math.PI * 2;
+const rand = Math.random;
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+const ease = (t) => 1 - Math.pow(1 - t, 3);
+
+const video = $("cam");
+const hud = $("hud");
+const ctx = hud.getContext("2d");
+const statusEl = $("status");
+const tabsEl = $("tabs");
+
+let W = innerWidth, H = innerHeight;
+let note = "Starting camera…";   // message shown in the status line
+
+// ---- Tuning knobs (change these and see what happens!) ----
+const DOT_SIZE = 0.14;      // size of every dot
+const STRETCH = 0.42;       // how far parts spread ALONG the axis when exploded
+const RADIAL = 1.7;         // how far side parts slide OUT when exploded
+const PULL_SNAP = 0.6;      // release closer than this to its place -> snaps back
+const HIT_RADIUS = 42;      // pixels: how close your pinch must be to a part
+
+// =====================================================================
+// 1. THREE.JS BASICS: scene, camera, renderer (transparent so webcam shows)
+// =====================================================================
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(55, W / H, 0.1, 100);
+camera.position.set(0, 0, 10);
+
+const renderer = new THREE.WebGLRenderer({ canvas: $("three"), alpha: true, antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(W, H, false);
+renderer.setClearColor(0x000000, 0);
+
+// engine = what we move/rotate/zoom.  holder = used for the "pop-in" animation.
+const engine = new THREE.Group();
+const holder = new THREE.Group();
+engine.add(holder);
+engine.rotation.x = 0.25;
+scene.add(engine);
+
+// Each dot is a small shaded ball with a DARK rim, so it stays visible on
+// any background (this replaces the washed-out glowing look).
+function makeSprite() {
+  const c = document.createElement("canvas");
+  c.width = c.height = 64;
+  const g = c.getContext("2d");
+  const grad = g.createRadialGradient(26, 26, 2, 32, 32, 30);
+  grad.addColorStop(0, "#ffffff");
+  grad.addColorStop(0.55, "#d8d8d8");
+  grad.addColorStop(0.8, "#3a3a3a");
+  grad.addColorStop(1, "#000000");
+  g.beginPath(); g.arc(32, 32, 30, 0, TAU);
+  g.fillStyle = grad; g.fill();
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+const sprite = makeSprite();
+
+// =====================================================================
+// 2. POINT SAMPLERS: each returns random points on a shape.
+//    A machine part is just a cloud of these points.
+// =====================================================================
+// Spin a profile around the Y axis. radiusAt(u): u=0 bottom, u=1 top.
+function lathe(h, n, radiusAt) {
+  const a = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) {
+    const u = rand(), t = rand() * TAU, r = radiusAt(u);
+    a[i*3] = Math.cos(t) * r;
+    a[i*3+1] = (u - 0.5) * h;
+    a[i*3+2] = Math.sin(t) * r;
+  }
+  return a;
+}
+const cyl = (r, h, n) => lathe(h, n, () => r);
+
+function ball(r, n, filled = false) {
+  const a = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) {
+    const z = rand() * 2 - 1, t = rand() * TAU, s = Math.sqrt(1 - z * z);
+    const rr = filled ? r * Math.cbrt(rand()) : r;
+    a[i*3] = s * Math.cos(t) * rr;
+    a[i*3+1] = z * rr;
+    a[i*3+2] = s * Math.sin(t) * rr;
+  }
+  return a;
+}
+
+// Ring lying flat (around the Y axis). R = ring radius, r = tube radius.
+function torus(R, r, n) {
+  const a = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) {
+    const u = rand() * TAU, v = rand() * TAU;
+    a[i*3] = (R + r * Math.cos(v)) * Math.cos(u);
+    a[i*3+1] = r * Math.sin(v);
+    a[i*3+2] = (R + r * Math.cos(v)) * Math.sin(u);
+  }
+  return a;
+}
+
+function disc(r0, r1, n) {
+  const a = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) {
+    const r = Math.sqrt(r0 * r0 + rand() * (r1 * r1 - r0 * r0)), t = rand() * TAU;
+    a[i*3] = Math.cos(t) * r;
+    a[i*3+1] = 0;
+    a[i*3+2] = Math.sin(t) * r;
+  }
+  return a;
+}
+
+// Fan / pump / turbine blades: `count` curved blades radiating from the center
+function blades(count, r0, r1, n, chord, twist) {
+  const a = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) {
+    const k = Math.floor(rand() * count);
+    const f = rand();
+    const r = r0 + (r1 - r0) * f;
+    const ang = (k / count) * TAU + twist * f + (rand() - 0.5) * (chord / r);
+    a[i*3] = Math.cos(ang) * r;
+    a[i*3+1] = (rand() - 0.5) * 0.04;
+    a[i*3+2] = Math.sin(ang) * r;
+  }
+  return a;
+}
+
+// Vertical lines around the Y axis (cooling channels). radiusAt(u) follows a profile.
+function ribs(count, h, n, radiusAt) {
+  const a = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) {
+    const k = Math.floor(rand() * count), u = rand();
+    const ang = (k / count) * TAU, r = radiusAt(u);
+    a[i*3] = Math.cos(ang) * r;
+    a[i*3+1] = (u - 0.5) * h;
+    a[i*3+2] = Math.sin(ang) * r;
+  }
+  return a;
+}
+
+function box(w, h, d, n) {
+  const a = new Float32Array(n * 3);
+  const size = [w, h, d];
+  const area = [h * d, w * d, w * h];
+  const total = area[0] + area[1] + area[2];
+  for (let i = 0; i < n; i++) {
+    const p = [(rand() - 0.5) * w, (rand() - 0.5) * h, (rand() - 0.5) * d];
+    const q = rand() * total;
+    const axis = q < area[0] ? 0 : q < area[0] + area[1] ? 1 : 2;
+    p[axis] = (rand() < 0.5 ? -0.5 : 0.5) * size[axis];   // push onto a face
+    a[i*3] = p[0]; a[i*3+1] = p[1]; a[i*3+2] = p[2];
+  }
+  return a;
+}
+
+function shift(a, x, y, z) {
+  for (let i = 0; i < a.length; i += 3) { a[i] += x; a[i+1] += y; a[i+2] += z; }
+  return a;
+}
+function concat(...arrs) {
+  const out = new Float32Array(arrs.reduce((s, a) => s + a.length, 0));
+  let o = 0;
+  for (const a of arrs) { out.set(a, o); o += a.length; }
+  return out;
+}
+
+// =====================================================================
+// 3. THE MACHINES
+//    P(name, color, points, options)
+//      pos   = where the part sits when assembled [x,y,z]
+//      rz/rx = tilt
+//      rad   = [x,z] direction it slides OUT when exploded (side parts)
+//      lift  = extra upward move when exploded
+//      delay = 0..0.4  start moving later (so the main stack opens first)
+//      ex    = (old way) explicit explode vector, overrides the automatic one
+// =====================================================================
+const P = (name, color, pts, o = {}) => ({
+  name, color, pts,
+  pos: o.pos || [0, 0, 0], rz: o.rz || 0, rx: o.rx || 0,
+  rad: o.rad || [0, 0], lift: o.lift || 0, delay: o.delay || 0,
+  ex: o.ex || null, pulse: !!o.pulse,
+});
+
+const MODELS = {
+  // ------------------------------------------------------------------
+  // 26 parts, like a real staged-combustion rocket engine
+  // ------------------------------------------------------------------
+  "Rocket Engine": () => {
+    const nozR = (y) => 0.5 + 1.1 * Math.sqrt(Math.max(0, 1 - (y / 2.6 + 0.5)));
+    const chR = (u) => (u < 0.45 ? 0.5 + 0.4 * (u / 0.45) : 0.9);
+    return [
+      // --- top: mounting + tanks interface ---
+      P("Gimbal Ring",        0x5c6b80, torus(0.9, 0.09, 900), { pos: [0, 3.5, 0] }),
+      P("Thrust Structure",   0x3f63a0, lathe(0.9, 1500, (u) => 0.9 - 0.55 * u), { pos: [0, 3.0, 0] }),
+      P("Oxidizer Dome",      0x1f5fd1, lathe(0.8, 1800, (u) => 0.9 * Math.sqrt(1 - u * u)), { pos: [0, 2.2, 0] }),
+      P("Injector Plate",     0x7b3fc4, concat(disc(0, 0.9, 1200), torus(0.3, 0.03, 300), torus(0.6, 0.03, 500)), { pos: [0, 1.7, 0] }),
+      P("Chamber Flange",     0x6d7682, torus(0.98, 0.07, 700), { pos: [0, 1.7, 0] }),
+
+      // --- the heart: chamber, cooling, throat ---
+      P("Combustion Chamber", 0x7d8793, lathe(1.6, 3200, chR), { pos: [0, 0.9, 0] }),
+      P("Cooling Channels",   0x00927f, ribs(28, 1.6, 2200, (u) => chR(u) + 0.06), { pos: [0, 0.9, 0] }),
+      P("Plasma Core",        0xff8c00, ball(0.38, 1300, true), { pos: [0, 1.0, 0], pulse: true }),
+      P("Throat Ring",        0xc99700, torus(0.55, 0.08, 600), { pos: [0, 0.1, 0] }),
+
+      // --- bell nozzle ---
+      P("Nozzle Bell",        0x4d78a8, lathe(2.6, 4400, (u) => 0.5 + 1.1 * Math.sqrt(1 - u)), { pos: [0, -1.2, 0] }),
+      P("Nozzle Bands",       0xb5651d, concat(
+          shift(torus(nozR(0.7) + 0.04, 0.04, 450), 0, 0.7, 0),
+          shift(torus(nozR(0.1) + 0.04, 0.04, 450), 0, 0.1, 0),
+          shift(torus(nozR(-0.5) + 0.04, 0.04, 450), 0, -0.5, 0)), { pos: [0, -1.2, 0] }),
+      P("Exit Rim",           0xc1121f, torus(1.64, 0.07, 900), { pos: [0, -2.5, 0] }),
+
+      // --- fuel side (right) ---
+      P("Fuel Turbopump",     0xb5651d, concat(cyl(0.38, 1.2, 1800), shift(disc(0, 0.38, 300), 0, 0.6, 0)), { pos: [1.75, 1.1, 0], rad: [1, 0], delay: 0.12 }),
+      P("Fuel Impeller",      0xe09f00, blades(8, 0.06, 0.32, 600, 0.12, 0.8), { pos: [1.75, 1.4, 0], rad: [1, 0], lift: 0.9, delay: 0.3 }),
+      P("Fuel Feed Line",     0xd9691a, cyl(0.09, 1.47, 500), { pos: [1.325, 2.3, 0], rz: 0.62, rad: [1, 0], delay: 0.15 }),
+      P("Turbine Exhaust",    0x4d5566, cyl(0.1, 1.5, 500), { pos: [1.6, -0.25, 0], rz: -0.2, rad: [1, 0], delay: 0.2 }),
+
+      // --- oxidizer side (left) ---
+      P("Oxidizer Turbopump", 0x1a7f74, concat(cyl(0.38, 1.2, 1800), shift(disc(0, 0.38, 300), 0, 0.6, 0)), { pos: [-1.75, 1.1, 0], rad: [-1, 0], delay: 0.12 }),
+      P("Oxidizer Impeller",  0x1d8fb3, blades(8, 0.06, 0.32, 600, 0.12, -0.8), { pos: [-1.75, 1.4, 0], rad: [-1, 0], lift: 0.9, delay: 0.3 }),
+      P("Oxidizer Feed Line", 0x1b6f99, cyl(0.09, 1.47, 500), { pos: [-1.325, 2.3, 0], rz: -0.62, rad: [-1, 0], delay: 0.15 }),
+
+      // --- front / back accessories ---
+      P("Preburner",          0xb5121b, cyl(0.3, 0.8, 1000), { pos: [0, 1.2, 1.35], rad: [0, 1], delay: 0.15 }),
+      P("Preburner Duct",     0x7f5539, cyl(0.08, 0.75, 350), { pos: [0, 1.2, 0.85], rx: Math.PI / 2, rad: [0, 1], delay: 0.1 }),
+      P("Main Valve",         0x5e3f91, concat(ball(0.28, 500), shift(cyl(0.07, 0.6, 250), 0, 0.4, 0)), { pos: [0, 2.2, -1.2], rad: [0, -1], delay: 0.25 }),
+      P("Igniter",            0xd62828, concat(cyl(0.08, 0.6, 300), shift(ball(0.13, 200), 0, 0.3, 0)), { pos: [0.55, 1.95, 0.55], rad: [0.7, 0.7], delay: 0.25 }),
+      P("Gimbal Actuator A",  0x6c7a92, concat(cyl(0.07, 1.9, 450), shift(ball(0.12, 150), 0, 0.95, 0), shift(ball(0.12, 150), 0, -0.95, 0)), { pos: [0.5, 2.5, 0.95], rz: -0.12, rad: [0.7, 0.7], delay: 0.2 }),
+      P("Gimbal Actuator B",  0x6c7a92, concat(cyl(0.07, 1.9, 450), shift(ball(0.12, 150), 0, 0.95, 0), shift(ball(0.12, 150), 0, -0.95, 0)), { pos: [-0.5, 2.5, -0.95], rz: 0.12, rad: [-0.7, -0.7], delay: 0.2 }),
+    ];
+  },
+
+  "Turbofan Jet": () => [
+    P("Spinner Cone",  0x7a8799, lathe(0.9, 900, (u) => 0.45 * (1 - u)), { pos: [0, 3.4, 0], ex: [0, 2.0, 0] }),
+    P("Fan Blades",    0x2f80ed, blades(18, 0.35, 1.5, 2600, 0.22, 0.5), { pos: [0, 2.6, 0], ex: [0, 1.3, 0] }),
+    P("Compressor",    0x1b998b, concat(
+        blades(24, 0.3, 0.95, 900, 0.14, 0.4),
+        shift(blades(24, 0.3, 0.85, 900, 0.14, -0.4), 0, 0.3, 0),
+        shift(blades(24, 0.3, 0.75, 900, 0.14, 0.4), 0, 0.6, 0)), { pos: [0, 1.5, 0], ex: [0, 0.7, 0] }),
+    P("Combustor",     0xe85d04, torus(0.75, 0.32, 2200), { pos: [0, 0.4, 0], ex: [1.9, 0.2, 0], pulse: true }),
+    P("Turbine",       0xc99700, concat(
+        blades(20, 0.25, 0.8, 900, 0.16, 0.5),
+        shift(blades(20, 0.25, 0.7, 900, 0.16, -0.5), 0, -0.3, 0)), { pos: [0, -0.7, 0], ex: [0, -0.8, 0] }),
+    P("Exhaust Cone",  0xc1121f, concat(
+        lathe(1.3, 1400, (u) => 0.5 + 0.35 * u),
+        shift(lathe(1.0, 500, (u) => 0.3 * u), 0, -0.3, 0)), { pos: [0, -2.0, 0], ex: [0, -1.8, 0] }),
+    P("Outer Casing",  0x4a6fa5, cyl(1.75, 3.6, 2600), { pos: [0, 1.7, 0], ex: [-2.6, 0, 0] }),
+  ],
+
+  "Robot Arm": () => {
+    const th = 1.0;                                   // upper arm tilt (radians)
+    const dir = [Math.sin(th), Math.cos(th)];
+    const elbow = [0, 0.6];
+    const mid = [elbow[0] + dir[0], elbow[1] + dir[1]];
+    const wrist = [elbow[0] + dir[0] * 2, elbow[1] + dir[1] * 2];
+    const grip = [wrist[0] + dir[0] * 0.55, wrist[1] + dir[1] * 0.55];
+    return [
+      P("Base",           0x4a6fa5, concat(cyl(1.1, 0.4, 1600), shift(disc(0, 1.1, 800), 0, 0.2, 0)), { pos: [0, -2.3, 0], ex: [0, -1.2, 0] }),
+      P("Shoulder Joint", 0x1b998b, ball(0.5, 1500), { pos: [0, -1.8, 0], ex: [-1.8, -0.6, 0] }),
+      P("Lower Arm",      0x2f80ed, box(0.4, 2.2, 0.4, 2600), { pos: [0, -0.6, 0], ex: [-2.2, 0, 0] }),
+      P("Elbow Joint",    0xc99700, ball(0.45, 1400), { pos: [elbow[0], elbow[1], 0], ex: [-1.8, 0.8, 0], pulse: true }),
+      P("Upper Arm",      0x2f80ed, box(0.35, 2, 0.35, 2400), { pos: [mid[0], mid[1], 0], rz: -th, ex: [0.8, 1.2, 0] }),
+      P("Wrist Joint",    0xe85d04, ball(0.3, 1000), { pos: [wrist[0], wrist[1], 0], ex: [1.6, 0.5, 0] }),
+      P("Gripper",        0xc1121f, concat(
+          shift(box(0.14, 0.7, 0.14, 800), -0.2, 0, 0),
+          shift(box(0.14, 0.7, 0.14, 800), 0.2, 0, 0)), { pos: [grip[0], grip[1], 0], rz: -th, ex: [1.4, 1.4, 0] }),
+    ];
+  },
+};
+const MODEL_NAMES = Object.keys(MODELS);
+const HAS_AXIS = { "Rocket Engine": true, "Turbofan Jet": true, "Robot Arm": false };
+
+// =====================================================================
+// 4. LOADING A MACHINE INTO THE SCENE (particles = THREE.Points)
+// =====================================================================
+let parts = [];
+let current = "";
+let popT = 1;   // 0 -> 1 pop-in animation
+
+const COL_HOVER = new THREE.Color(0xffc800);
+const COL_GRAB = new THREE.Color(0x00d9ff);
+
+function loadModel(name) {
+  endGrab();
+  current = name;
+  for (const p of parts) {
+    holder.remove(p.obj);
+    p.obj.geometry.dispose();
+    p.obj.material.dispose();
+  }
+  const defs = MODELS[name]();
+  const ys = defs.map((d) => d.pos[1]);
+  const center = (Math.max(...ys) + Math.min(...ys)) / 2;   // keep the machine centered
+
+  parts = defs.map((d) => {
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.BufferAttribute(d.pts, 3));
+    const mat = new THREE.PointsMaterial({
+      color: d.color, size: DOT_SIZE, map: sprite, alphaTest: 0.4,
+      sizeAttenuation: true,           // solid, depth-tested dots (no see-through glow)
+    });
+    const obj = new THREE.Points(geo, mat);
+    obj.rotation.set(d.rx, 0, d.rz);
+    holder.add(obj);
+
+    const home = new THREE.Vector3(d.pos[0], d.pos[1] - center, d.pos[2]);
+    // Exploded position: spread along the axis (stretch) + slide side parts outward.
+    const ex = d.ex
+      ? new THREE.Vector3(...d.ex)
+      : new THREE.Vector3(d.rad[0] * RADIAL, home.y * STRETCH + d.lift, d.rad[1] * RADIAL);
+
+    // A few sample points per part, used to know where the part is on screen
+    const count = d.pts.length / 3, S = Math.min(200, count);
+    const sidx = new Int32Array(S);
+    for (let i = 0; i < S; i++) sidx[i] = Math.floor(rand() * count);
+
+    return {
+      name: d.name, obj, pulse: d.pulse, delay: d.delay, home, ex,
+      base: new THREE.Color(d.color),
+      off: new THREE.Vector3(),         // how far YOU pulled it out of place
+      grabbed: false, snap: false, hover: false,
+      sidx, sp: new Float32Array(S * 3),
+    };
+  });
+  popT = 0;
+  [...tabsEl.children].forEach((b) => b.classList.toggle("on", b.dataset.name === name));
+}
+
+// Bottom tab bar
+MODEL_NAMES.forEach((n, i) => {
+  const b = document.createElement("button");
+  b.textContent = `${i + 1} · ${n}`;
+  b.dataset.name = n;
+  b.onclick = () => loadModel(n);
+  tabsEl.appendChild(b);
+});
+const tabButtons = [...tabsEl.children];
+
+// =====================================================================
+// 5. HAND TRACKING (MediaPipe). Loaded after the page starts, so the
+//    3D scene works even if the camera or internet fails.
+// =====================================================================
+let landmarker = null;
+let lastVT = -1;
+let lastRaw = [];
+const pinchState = [false, false];
+
+// Webcam is shown with object-fit: cover and mirrored, so convert the
+// hand's normalized (0..1) position into real screen pixels.
+function toScreen(lm) {
+  const vw = video.videoWidth || 1280, vh = video.videoHeight || 720;
+  const s = Math.max(W / vw, H / vh);
+  const ox = (W - vw * s) / 2, oy = (H - vh * s) / 2;
+  return { x: W - (lm.x * vw * s + ox), y: lm.y * vh * s + oy };
+}
+
+function readHands() {
+  if (!landmarker || video.readyState < 2) return [];
+  if (video.currentTime !== lastVT) {          // only run on a NEW video frame
+    lastVT = video.currentTime;
+    const res = landmarker.detectForVideo(video, performance.now());
+    lastRaw = res.landmarks || [];
+  }
+  return lastRaw.map((lm, i) => {
+    const pts = lm.map(toScreen);                   // 21 points in pixels
+    const size = dist(pts[0], pts[9]) || 1;         // wrist -> middle knuckle
+    const ratio = dist(pts[4], pts[8]) / size;      // thumb tip <-> index tip
+    // hysteresis: harder to start a pinch than to keep it (stops flicker)
+    const pinching = pinchState[i] ? ratio < 0.45 : ratio < 0.3;
+    pinchState[i] = pinching;
+    return {
+      pts, size, pinching,
+      palm: pts[9],
+      tip: pts[8],
+      pinch: { x: (pts[4].x + pts[8].x) / 2, y: (pts[4].y + pts[8].y) / 2 },
+    };
+  });
+}
+
+(async () => {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: 1280, height: 720, facingMode: "user" }, audio: false,
+    });
+    video.srcObject = stream;
+    await video.play();
+    note = "Camera on · loading hand tracker…";
+  } catch (e) {
+    console.error(e);
+    note = "Camera blocked — use mouse/keys (drag, scroll, E, 1-3)";
+    return;
+  }
+  try {
+    const V = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+    const { FilesetResolver, HandLandmarker } = await import(`${V}/vision_bundle.mjs`);
+    const fileset = await FilesetResolver.forVisionTasks(`${V}/wasm`);
+    const make = (delegate) => HandLandmarker.createFromOptions(fileset, {
+      baseOptions: {
+        modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+        delegate,
+      },
+      runningMode: "VIDEO",
+      numHands: 2,
+    });
+    try { landmarker = await make("GPU"); } catch { landmarker = await make("CPU"); }
+    note = "Hand tracker ready ✋";
+  } catch (e) {
+    console.error(e);
+    note = "Hand tracker failed to load (check internet) — mouse/keys still work";
+  }
+})();
+
+// =====================================================================
+// 6. STATE + PICKING + GRABBING PARTS
+// =====================================================================
+let explode = 0, explodeTarget = 0;     // 0 = assembled, 1 = fully exploded
+let scale = 1, targetScale = 1;         // zoom
+const vel = { x: 0, y: 0 };             // rotation speed (inertia)
+const drag = { active: false, x: 0, y: 0 };
+const zoomG = { active: false, d0: 1, s0: 1 };
+const followTarget = new THREE.Vector3();
+const ROT = 5;                          // radians per full-screen drag
+
+const _w = new THREE.Vector3(), _u = new THREE.Vector3();
+
+// Which part is under this screen point? (uses the dots' screen positions)
+function pickPart(x, y) {
+  let best = -1, bd = HIT_RADIUS;
+  parts.forEach((p, i) => {
+    const sp = p.sp;
+    for (let j = 0; j < sp.length; j += 3) {
+      const d = Math.hypot(sp[j] - x, sp[j + 1] - y);
+      if (d < bd) { bd = d; best = i; }
+    }
+  });
+  return best;
+}
+
+// Turn a screen point + depth into a 3D point
+function unprojectTo(x, y, ndcZ, out) {
+  return out.set((x / W) * 2 - 1, -((y / H) * 2 - 1), ndcZ).unproject(camera);
+}
+
+// --- grabbing: the part follows your pinch, at the same depth ---
+const grab = { part: null, ndcZ: 0, l0: new THREE.Vector3(), off0: new THREE.Vector3() };
+
+function startGrab(i, p) {
+  const part = parts[i];
+  holder.updateWorldMatrix(true, false);
+  part.obj.getWorldPosition(_w).project(camera);
+  grab.part = part;
+  grab.ndcZ = _w.z;
+  unprojectTo(p.x, p.y, grab.ndcZ, _u);
+  grab.l0.copy(holder.worldToLocal(_u));
+  grab.off0.copy(part.off);
+  part.snap = false;
+  part.grabbed = true;
+}
+function updateGrab(p) {
+  unprojectTo(p.x, p.y, grab.ndcZ, _u);
+  holder.worldToLocal(_u);
+  grab.part.off.copy(grab.off0).add(_u).sub(grab.l0);
+}
+function endGrab() {
+  const part = grab.part;
+  if (!part) return;
+  part.grabbed = false;
+  if (part.off.length() < PULL_SNAP) part.snap = true;   // released near: slides back in
+  grab.part = null;                                       // released far: stays removed
+}
+
+// =====================================================================
+// 7. GESTURE LOGIC (the "brain")
+// =====================================================================
+let pinchWas = false;
+let pinchMode = null;   // "grab" (pinch started on a part) or "rotate"
+
+function gestures(hands) {
+  followTarget.set(0, 0, 0);
+  const h1 = hands.length === 1 ? hands[0] : null;
+
+  if (hands.length !== 1 && grab.part && !mouse.down) endGrab();   // hand lost / second hand appeared
+
+  // ---- ONE HAND PINCH: on a part = pull it out, on empty space = rotate ----
+  if (h1 && h1.pinching) {
+    const p = h1.pinch;
+    if (!pinchWas) {                                  // pinch just started
+      const idx = pickPart(p.x, p.y);
+      if (idx >= 0) { startGrab(idx, p); pinchMode = "grab"; }
+      else pinchMode = "rotate";
+    }
+    if (pinchMode === "grab" && grab.part) {
+      updateGrab(p);
+      drag.active = false;
+    } else if (pinchMode === "rotate") {
+      if (drag.active) {
+        let dx = p.x - drag.x, dy = p.y - drag.y;
+        if (Math.abs(dx) < 1.2) dx = 0;               // ignore tiny jitter
+        if (Math.abs(dy) < 1.2) dy = 0;
+        vel.y = (dx / W) * ROT;
+        vel.x = (dy / H) * ROT;
+      }
+      drag.active = true; drag.x = p.x; drag.y = p.y;
+    }
+  } else {
+    if (pinchWas && pinchMode === "grab" && !mouse.down) endGrab();
+    pinchMode = null;
+    drag.active = false;
+  }
+  pinchWas = !!(h1 && h1.pinching);
+
+  // ---- TWO HANDS ----
+  if (hands.length >= 2) {
+    const [a, b] = hands;
+    const d = dist(a.palm, b.palm);
+    const mid = { x: (a.palm.x + b.palm.x) / 2, y: (a.palm.y + b.palm.y) / 2 };
+
+    // machine floats between your hands (screen px -> 3D units at z = 0)
+    const halfH = Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) * camera.position.z;
+    followTarget.set(((mid.x / W) * 2 - 1) * halfH * camera.aspect, -((mid.y / H) * 2 - 1) * halfH, 0);
+
+    if (a.pinching && b.pinching) {                 // 🤏🤏 zoom
+      if (!zoomG.active) { zoomG.active = true; zoomG.d0 = d; zoomG.s0 = targetScale; }
+      else targetScale = clamp(zoomG.s0 * (d / zoomG.d0), 0.4, 2.2);
+    } else {
+      zoomG.active = false;
+      if (!a.pinching && !b.pinching) {             // 🙌 exploded view
+        explodeTarget = clamp((d / W - 0.22) / (0.55 - 0.22), 0, 1);
+      }
+    }
+  } else {
+    zoomG.active = false;
+  }
+}
+
+// ---- Mouse / keyboard (also lets you test without a camera) ----
+const mouse = { down: false, x: 0, y: 0, mode: null };
+addEventListener("pointerdown", (e) => {
+  if (e.target.closest("#tabs") || e.target.closest("#help")) return;
+  mouse.down = true; mouse.x = e.clientX; mouse.y = e.clientY;
+  const idx = pickPart(e.clientX, e.clientY);
+  if (idx >= 0) { mouse.mode = "grab"; startGrab(idx, { x: e.clientX, y: e.clientY }); }
+  else mouse.mode = "rotate";
+});
+addEventListener("pointerup", () => {
+  if (mouse.down && mouse.mode === "grab") endGrab();
+  mouse.down = false; mouse.mode = null;
+});
+addEventListener("pointermove", (e) => {
+  if (!mouse.down) return;
+  if (mouse.mode === "grab") { updateGrab({ x: e.clientX, y: e.clientY }); return; }
+  vel.y = ((e.clientX - mouse.x) / W) * ROT;
+  vel.x = ((e.clientY - mouse.y) / H) * ROT;
+  mouse.x = e.clientX; mouse.y = e.clientY;
+});
+addEventListener("wheel", (e) => {
+  targetScale = clamp(targetScale * (1 - e.deltaY * 0.001), 0.4, 2.2);
+}, { passive: true });
+addEventListener("keydown", (e) => {
+  const k = e.key.toLowerCase();
+  const idx = parseInt(k, 10) - 1;
+  if (idx >= 0 && idx < MODEL_NAMES.length) loadModel(MODEL_NAMES[idx]);
+  if (k === "e") explodeTarget = explodeTarget > 0.5 ? 0 : 1;
+  if (k === "r") {                                 // reinstall every part + reset view
+    endGrab();
+    parts.forEach((p) => { p.snap = true; });
+    explodeTarget = 0; targetScale = 1;
+    engine.rotation.set(0.25, 0, 0); vel.x = vel.y = 0;
+  }
+});
+
+// Pointing at a tab for ~1 second clicks it (touchless button)
+const dwell = { el: null, t: 0 };
+function updateDwell(cursor, dt) {
+  let hit = null;
+  if (cursor) {
+    for (const b of tabButtons) {
+      const r = b.getBoundingClientRect();
+      if (cursor.x >= r.left - 10 && cursor.x <= r.right + 10 &&
+          cursor.y >= r.top - 10 && cursor.y <= r.bottom + 10) { hit = b; break; }
+    }
+  }
+  if (hit && hit === dwell.el) {
+    dwell.t += dt;
+    if (dwell.t >= 0.9) { hit.click(); dwell.t = -1.5; }   // negative = cooldown
+  } else { dwell.el = hit; dwell.t = 0; }
+  return hit ? Math.max(0, dwell.t) / 0.9 : 0;
+}
+
+// =====================================================================
+// 8. HUD DRAWING (skeleton, rings, labels, guide rails) on a 2D canvas
+// =====================================================================
+const BONES = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],
+               [9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+const TIPS = [4, 8, 12, 16, 20];
+
+function drawSkeleton(h) {
+  ctx.save();
+  ctx.strokeStyle = "rgba(255,255,255,0.9)";
+  ctx.lineWidth = 2;
+  ctx.shadowColor = "#000"; ctx.shadowBlur = 5;
+  ctx.beginPath();
+  for (const [a, b] of BONES) { ctx.moveTo(h.pts[a].x, h.pts[a].y); ctx.lineTo(h.pts[b].x, h.pts[b].y); }
+  ctx.stroke();
+  h.pts.forEach((p, i) => {
+    ctx.fillStyle = TIPS.includes(i) ? "#7df9ff" : "#fff";
+    ctx.beginPath(); ctx.arc(p.x, p.y, TIPS.includes(i) ? 4.5 : 3, 0, TAU); ctx.fill();
+  });
+  ctx.restore();
+}
+
+function drawRing(c, R, color, t, dir) {
+  ctx.save();
+  ctx.translate(c.x, c.y);
+  ctx.strokeStyle = color; ctx.shadowColor = color; ctx.shadowBlur = 14;
+  ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(0, 0, R, 0, TAU); ctx.stroke();
+  ctx.rotate(t * 0.6 * dir);
+  ctx.setLineDash([R * 0.5, R * 0.3]);
+  ctx.lineWidth = 4;
+  ctx.beginPath(); ctx.arc(0, 0, R * 0.88, 0, TAU); ctx.stroke();
+  ctx.restore();
+}
+
+// Dashed "assembly rails": from where each part belongs to where it is now
+function drawRails(proj, axis) {
+  ctx.save();
+  ctx.setLineDash([5, 6]);
+  ctx.lineWidth = 1.2;
+  ctx.strokeStyle = "rgba(255,255,255,0.55)";
+  ctx.shadowColor = "#000"; ctx.shadowBlur = 3;
+  if (axis) {                                       // the main assembly axis
+    ctx.beginPath(); ctx.moveTo(axis.a.x, axis.a.y); ctx.lineTo(axis.b.x, axis.b.y); ctx.stroke();
+  }
+  for (const p of proj) {
+    if (Math.hypot(p.sx - p.hx, p.sy - p.hy) < 14) continue;
+    ctx.beginPath(); ctx.moveTo(p.hx, p.hy); ctx.lineTo(p.sx, p.sy); ctx.stroke();
+    ctx.beginPath(); ctx.arc(p.hx, p.hy, 2.5, 0, TAU); ctx.stroke();    // where it belongs
+  }
+  ctx.restore();
+}
+
+function drawLabels(proj) {
+  const items = proj.map((p, i) => ({ ...p, i })).sort((a, b) => a.sy - b.sy);
+  const left = [], right = [];
+  items.forEach((it, k) => (k % 2 ? right : left).push(it));   // alternate sides
+  ctx.save();
+  ctx.font = "12px 'Courier New', monospace";
+  ctx.textBaseline = "middle";
+  ctx.lineWidth = 1;
+  ctx.shadowColor = "#000"; ctx.shadowBlur = 4;
+  const top = 90, bottom = H - 140;
+  for (const [side, list] of [["L", left], ["R", right]]) {
+    const gap = Math.min(30, (bottom - top) / Math.max(1, list.length));
+    let lastY = -999;
+    for (const it of list) {
+      const y = Math.max(clamp(it.sy, top, bottom), lastY + gap);   // no overlaps
+      lastY = y;
+      const text = `${String(it.i + 1).padStart(2, "0")} ${it.name.toUpperCase()}${it.removed ? "  ▸ REMOVED" : ""}`;
+      const tw = ctx.measureText(text).width;
+      const x = side === "L" ? 36 : W - 36;
+      const ex = side === "L" ? x + tw + 10 : x - tw - 10;
+      const col = it.grabbed ? "#00d9ff" : it.hover ? "#ffc800" : it.removed ? "#ff9d5c" : "rgba(160,245,255,0.95)";
+      ctx.strokeStyle = col; ctx.fillStyle = col;
+      ctx.globalAlpha = it.hover || it.grabbed ? 1 : 0.8;
+      ctx.beginPath(); ctx.moveTo(it.sx, it.sy); ctx.lineTo(ex, y); ctx.stroke();       // leader line
+      ctx.beginPath(); ctx.arc(it.sx, it.sy, 3, 0, TAU); ctx.fill();                    // anchor dot
+      ctx.textAlign = side === "L" ? "left" : "right";
+      ctx.fillText(text, x, y);
+      ctx.beginPath();                                                                  // underline
+      ctx.moveTo(x, y + 10); ctx.lineTo(side === "L" ? x + tw : x - tw, y + 10); ctx.stroke();
+    }
+  }
+  ctx.restore();
+}
+
+function drawHud(hands, proj, axis, cursor, dwellP, t) {
+  ctx.clearRect(0, 0, W, H);
+  if (explode > 0.03 || proj.some((p) => p.removed || p.grabbed)) drawRails(proj, explode > 0.03 ? axis : null);
+  drawLabels(proj);
+  hands.forEach((h, i) => {
+    drawSkeleton(h);
+    drawRing(h.palm, h.size * 2.1, i === 0 ? "#ffffff" : "#ffd166", t, i === 0 ? 1 : -1);
+    if (h.pinching) {                              // show where you are pinching
+      ctx.save();
+      ctx.fillStyle = grab.part ? "#00d9ff" : "#ffc800";
+      ctx.shadowColor = "#000"; ctx.shadowBlur = 6;
+      ctx.beginPath(); ctx.arc(h.pinch.x, h.pinch.y, 9, 0, TAU); ctx.fill();
+      ctx.restore();
+    }
+  });
+  if (hands.length >= 2) {
+    ctx.save();
+    ctx.strokeStyle = "rgba(255,209,102,0.6)"; ctx.setLineDash([6, 8]); ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(hands[0].palm.x, hands[0].palm.y); ctx.lineTo(hands[1].palm.x, hands[1].palm.y); ctx.stroke();
+    ctx.restore();
+  }
+  if (cursor) {
+    ctx.save();
+    ctx.strokeStyle = "#7df9ff"; ctx.lineWidth = 2; ctx.shadowColor = "#000"; ctx.shadowBlur = 6;
+    ctx.beginPath(); ctx.arc(cursor.x, cursor.y, 12, 0, TAU); ctx.stroke();
+    if (dwellP > 0) {
+      ctx.strokeStyle = "#ffd166"; ctx.lineWidth = 4;
+      ctx.beginPath(); ctx.arc(cursor.x, cursor.y, 18, -Math.PI / 2, -Math.PI / 2 + TAU * dwellP); ctx.stroke();
+    }
+    ctx.restore();
+  }
+}
+
+// =====================================================================
+// 9. MAIN LOOP (runs every frame)
+// =====================================================================
+const clock = new THREE.Clock();
+const _v = new THREE.Vector3(), _h = new THREE.Vector3(), _s = new THREE.Vector3();
+const _a = new THREE.Vector3(), _b = new THREE.Vector3();
+
+function frame() {
+  requestAnimationFrame(frame);
+  const dt = Math.min(clock.getDelta(), 0.05);
+  const t = clock.elapsedTime;
+
+  const hands = readHands();
+  gestures(hands);
+  const cursor = hands.length === 1 && !hands[0].pinching ? hands[0].tip : null;
+  const dwellP = updateDwell(cursor, dt);
+
+  // --- rotation with inertia (+ slow idle spin when nobody is interacting) ---
+  const rotating = drag.active || (mouse.down && mouse.mode === "rotate");
+  if (!rotating) { vel.x *= 0.94; vel.y *= 0.94; }
+  engine.rotation.y += vel.y;
+  engine.rotation.x = clamp(engine.rotation.x + vel.x, -1.2, 1.2);
+  if (!rotating && hands.length === 0 && !grab.part && !mouse.down) engine.rotation.y += 0.0025;
+  if (mouse.down && mouse.mode === "rotate") { vel.x = 0; vel.y = 0; }  // mouse speed is used once per move
+
+  // --- smooth the animated values ---
+  const k = Math.min(1, dt * 8);
+  explode += (explodeTarget - explode) * k;
+  scale += (targetScale - scale) * k;
+  engine.scale.setScalar(scale);
+  engine.position.lerp(followTarget, Math.min(1, dt * 6));
+  popT = Math.min(1, popT + dt * 1.6);
+  holder.scale.setScalar(0.001 + ease(popT));
+
+  // --- place every part: home + (exploded move) + (your pull) ---
+  for (const p of parts) {
+    const e = ease(clamp((explode - p.delay) / (1 - p.delay), 0, 1));   // staggered start
+    if (p.snap && !p.grabbed) {                                          // slide back into place
+      p.off.multiplyScalar(1 - Math.min(1, dt * 8));
+      if (p.off.length() < 0.01) { p.off.set(0, 0, 0); p.snap = false; }
+    }
+    p.obj.position.copy(p.home).addScaledVector(p.ex, e).add(p.off);
+
+    const mat = p.obj.material;
+    mat.color.lerp(p.grabbed ? COL_GRAB : p.hover ? COL_HOVER : p.base, 0.3);
+    const wanted = (p.pulse ? DOT_SIZE + 0.03 * Math.sin(t * 4) : DOT_SIZE) * (p.hover || p.grabbed ? 1.3 : 1);
+    mat.size += (wanted - mat.size) * 0.25;
+  }
+
+  // --- where is each part on screen? (labels, rails, picking) ---
+  engine.updateMatrixWorld(true);
+  const proj = parts.map((p) => {
+    _v.setFromMatrixPosition(p.obj.matrixWorld).project(camera);
+    _h.copy(p.home).applyMatrix4(holder.matrixWorld).project(camera);
+    const pos = p.obj.geometry.attributes.position.array, m = p.obj.matrixWorld;
+    for (let j = 0; j < p.sidx.length; j++) {
+      const q = p.sidx[j] * 3;
+      _s.set(pos[q], pos[q + 1], pos[q + 2]).applyMatrix4(m).project(camera);
+      p.sp[j * 3] = (_s.x + 1) / 2 * W;
+      p.sp[j * 3 + 1] = (1 - _s.y) / 2 * H;
+      p.sp[j * 3 + 2] = _s.z;
+    }
+    return {
+      name: p.name,
+      sx: (_v.x + 1) / 2 * W, sy: (1 - _v.y) / 2 * H,
+      hx: (_h.x + 1) / 2 * W, hy: (1 - _h.y) / 2 * H,
+      hover: false, grabbed: p.grabbed, removed: !p.grabbed && p.off.length() > 0.5,
+    };
+  });
+
+  const hoverIdx = grab.part ? parts.indexOf(grab.part) : cursor ? pickPart(cursor.x, cursor.y) : -1;
+  parts.forEach((p, i) => { p.hover = i === hoverIdx && !p.grabbed; });
+  proj.forEach((p, i) => { p.hover = i === hoverIdx && !p.grabbed; });
+
+  let axis = null;
+  if (HAS_AXIS[current]) {
+    _a.set(0, 7, 0); holder.localToWorld(_a).project(camera);
+    _b.set(0, -7, 0); holder.localToWorld(_b).project(camera);
+    axis = { a: { x: (_a.x + 1) / 2 * W, y: (1 - _a.y) / 2 * H }, b: { x: (_b.x + 1) / 2 * W, y: (1 - _b.y) / 2 * H } };
+  }
+
+  renderer.render(scene, camera);
+  drawHud(hands, proj, axis, cursor, dwellP, t);
+
+  const removedCount = proj.filter((p) => p.removed).length;
+  statusEl.textContent =
+    `${note}  |  ${current.toUpperCase()}  |  PARTS ${parts.length}  |  REMOVED ${removedCount}  |  HANDS ${hands.length}  |  EXPLODE ${Math.round(explode * 100)}%  |  ZOOM ${scale.toFixed(2)}x`;
+}
+
+// =====================================================================
+// 10. START + RESIZE
+// =====================================================================
+function resize() {
+  W = innerWidth; H = innerHeight;
+  camera.aspect = W / H;
+  camera.updateProjectionMatrix();
+  renderer.setSize(W, H, false);
+  const dpr = Math.min(devicePixelRatio, 2);
+  hud.width = W * dpr; hud.height = H * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+addEventListener("resize", resize);
+resize();
+
+loadModel(MODEL_NAMES[0]);
+frame();
+</script>
+</body>
+</html>
